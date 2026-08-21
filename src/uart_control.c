@@ -1,23 +1,24 @@
 #include "uart_control.h"
+
 #include <string.h>
 
 /**
  * @brief  初始化 UART 实例
  *
- * 绑定硬件操作 ops、收发缓冲区、空闲超时时间及完成回调。
+ * 绑定硬件操作 ops、接收缓冲区、空闲超时时间及完成回调。
  * 调用后需手动 uart_control_enable_rx 启动接收。
  *
  * @return UART_CONTROL_OK 成功，UART_CONTROL_ERROR 参数非法
  */
-uint8_t uart_control_init(struct uart_control               *uart,
+uint8_t uart_control_init(struct uart_control               *self,
                           const struct uart_control_hal_ops *ops,
                           uint8_t                           *rx_buf,
                           uint16_t                           rx_size,
                           uint16_t                           timeout_tick,
-                          void (*on_rx_done_callback)(struct uart_control *uart, uint16_t len),
-                          void (*on_tx_done_callback)(struct uart_control *uart))
+                          void (*on_rx_done_callback)(struct uart_control *self, uint16_t len),
+                          void (*on_tx_done_callback)(struct uart_control *self))
 {
-    if (uart == NULL || ops == NULL || rx_buf == NULL)
+    if (self == NULL || ops == NULL || rx_buf == NULL)
     {
         return UART_CONTROL_ERROR;
     }
@@ -33,14 +34,14 @@ uint8_t uart_control_init(struct uart_control               *uart,
         return UART_CONTROL_ERROR;
     }
 
-    memset(uart, 0, sizeof(*uart));
+    memset(self, 0, sizeof(*self));
 
-    uart->ops = ops;
-    uart->rx_buf = rx_buf;
-    uart->rx_size = rx_size;
-    uart->timeout_tick = timeout_tick;
-    uart->on_rx_done_callback = on_rx_done_callback;
-    uart->on_tx_done_callback = on_tx_done_callback;
+    self->ops = ops;
+    self->rx_buf = rx_buf;
+    self->rx_size = rx_size;
+    self->timeout_tick = timeout_tick;
+    self->on_rx_done_callback = on_rx_done_callback;
+    self->on_tx_done_callback = on_tx_done_callback;
 
     return UART_CONTROL_OK;
 }
@@ -53,22 +54,38 @@ uint8_t uart_control_init(struct uart_control               *uart,
  *
  * @return UART_CONTROL_OK 成功，UART_CONTROL_ERROR 参数非法
  */
-uint8_t uart_control_enable_rx(struct uart_control *uart)
+uint8_t uart_control_enable_rx(struct uart_control *self)
 {
-    if (uart == NULL || uart->ops == NULL || uart->rx_buf == NULL)
+    if (self == NULL || self->ops == NULL || self->ops->rx_start == NULL || self->rx_buf == NULL)
     {
         return UART_CONTROL_ERROR;
     }
 
-    uart->rx_wr = 0u;
-    uart->rx_rd = 0u;
-    uart->timeout_tick_cnt = 0u;
-    uart->rx_overflow = false;
-    uart->rx_active = true;
+    self->rx_wr = 0u;
+    self->rx_rd = 0u;
+    self->timeout_tick_cnt = 0u;
+    self->rx_overflow = false;
+    self->rx_active = true;
 
-    uart->ops->rx_start();
+    self->ops->rx_start();
 
     return UART_CONTROL_OK;
+}
+
+/**
+ * @brief  停止接收（关闭 RX 相关中断）
+ *
+ * 调用 ops->rx_stop 关闭 RX 中断并置 rx_active = false。
+ */
+void uart_control_disable_rx(struct uart_control *self)
+{
+    if ((self == NULL) || (self->ops == NULL) || (self->ops->rx_stop == NULL))
+    {
+        return;
+    }
+
+    self->ops->rx_stop();
+    self->rx_active = false;
 }
 
 /**
@@ -81,9 +98,9 @@ uint8_t uart_control_enable_rx(struct uart_control *uart)
  * @param len  发送字节数
  * @return UART_CONTROL_OK 成功，UART_CONTROL_ERROR 参数非法，UART_CONTROL_BUSY 发送忙
  */
-uint8_t uart_control_send(struct uart_control *uart, const uint8_t *buf, uint16_t len)
+uint8_t uart_control_send(struct uart_control *self, const uint8_t *buf, uint16_t len)
 {
-    if (uart == NULL || buf == NULL || uart->ops == NULL)
+    if (self == NULL || buf == NULL || self->ops == NULL || self->ops->send == NULL)
     {
         return UART_CONTROL_ERROR;
     }
@@ -93,13 +110,18 @@ uint8_t uart_control_send(struct uart_control *uart, const uint8_t *buf, uint16_
         return UART_CONTROL_ERROR;
     }
 
-    if (uart->tx_busy)
+    if (self->tx_busy)
     {
         return UART_CONTROL_BUSY;
     }
 
-    uart->tx_busy = true;
-    uart->ops->send(buf, len);
+    self->tx_busy = true;
+
+    if (self->ops->send(buf, len) != UART_CONTROL_OK)
+    {
+        self->tx_busy = false;
+        return UART_CONTROL_ERROR;
+    }
 
     return UART_CONTROL_OK;
 }
@@ -109,14 +131,14 @@ uint8_t uart_control_send(struct uart_control *uart, const uint8_t *buf, uint16_
  *
  * 在 on_rx_done_callback 回调中调用，返回值即帧总长度。
  */
-uint16_t uart_control_rx_len(struct uart_control *uart)
+uint16_t uart_control_rx_len(struct uart_control *self)
 {
-    if (uart == NULL)
+    if (self == NULL)
     {
         return 0u;
     }
 
-    return uart->rx_wr;
+    return self->rx_wr;
 }
 
 /**
@@ -124,14 +146,14 @@ uint16_t uart_control_rx_len(struct uart_control *uart)
  *
  * 配合 uart_control_rx_read 使用逐字节读取。
  */
-uint16_t uart_control_rx_remaining(struct uart_control *uart)
+uint16_t uart_control_rx_remaining(struct uart_control *self)
 {
-    if (uart == NULL)
+    if (self == NULL)
     {
         return 0u;
     }
 
-    return uart->rx_wr - uart->rx_rd;
+    return self->rx_wr - self->rx_rd;
 }
 
 /**
@@ -143,17 +165,17 @@ uint16_t uart_control_rx_remaining(struct uart_control *uart)
  * @param byte  输出参数，接收读取的字节
  * @return true 读取成功，false 无数据可读
  */
-bool uart_control_rx_read(struct uart_control *uart, uint8_t *byte)
+bool uart_control_rx_read(struct uart_control *self, uint8_t *byte)
 {
-    if (uart == NULL || uart->rx_buf == NULL || byte == NULL)
+    if (self == NULL || self->rx_buf == NULL || byte == NULL)
     {
         return false;
     }
 
-    if (uart->rx_rd < uart->rx_wr)
+    if (self->rx_rd < self->rx_wr)
     {
-        *byte = uart->rx_buf[uart->rx_rd];
-        uart->rx_rd++;
+        *byte = self->rx_buf[self->rx_rd];
+        self->rx_rd++;
         return true;
     }
 
@@ -166,14 +188,14 @@ bool uart_control_rx_read(struct uart_control *uart, uint8_t *byte)
  * 若返回 true，说明帧长超过 rx_size，数据被截断，帧不完整。
  * 应在 on_rx_done_callback 中检查。
  */
-bool uart_control_rx_overflow(struct uart_control *uart)
+bool uart_control_rx_overflow(struct uart_control *self)
 {
-    if (uart == NULL)
+    if (self == NULL)
     {
         return false;
     }
 
-    return uart->rx_overflow;
+    return self->rx_overflow;
 }
 
 /**
@@ -181,27 +203,42 @@ bool uart_control_rx_overflow(struct uart_control *uart)
  *
  * 可运行时更换回调，不影响接收状态。
  */
-void uart_control_bind_rx_done_callback(struct uart_control *uart, void (*callback)(struct uart_control *uart, uint16_t len))
+void uart_control_bind_rx_done_callback(struct uart_control *self, void (*callback)(struct uart_control *self, uint16_t len))
 {
-    if (uart == NULL)
+    if (self == NULL)
     {
         return;
     }
 
-    uart->on_rx_done_callback = callback;
+    self->on_rx_done_callback = callback;
 }
 
 /**
  * @brief  绑定发送完成回调
  */
-void uart_control_bind_tx_done_callback(struct uart_control *uart, void (*callback)(struct uart_control *uart))
+void uart_control_bind_tx_done_callback(struct uart_control *self, void (*callback)(struct uart_control *self))
 {
-    if (uart == NULL)
+    if (self == NULL)
     {
         return;
     }
 
-    uart->on_tx_done_callback = callback;
+    self->on_tx_done_callback = callback;
+}
+
+/**
+ * @brief  设置用户上下文
+ *
+ * 回调里通过 self->ctx 取回，用于多实例场景（避免调用方再维护全局单例）。
+ */
+void uart_control_set_ctx(struct uart_control *self, void *ctx)
+{
+    if (self == NULL)
+    {
+        return;
+    }
+
+    self->ctx = ctx;
 }
 
 /**
@@ -211,26 +248,31 @@ void uart_control_bind_tx_done_callback(struct uart_control *uart, void (*callba
  * 先判断 rx_active，再读硬件字节，避免在接收未使能时消耗硬件 FIFO。
  * 缓冲区满时刷新超时计数器并标记溢出，保证帧结束回调仍能触发。
  */
-void uart_control_rx_isr(struct uart_control *uart)
+void uart_control_rx_isr(struct uart_control *self)
 {
-    if (!uart->rx_active)
+    if (self == NULL || self->ops == NULL || self->ops->read_byte == NULL)
     {
         return;
     }
 
-    uint8_t byte = uart->ops->read_byte();
-
-    if (uart->rx_wr < uart->rx_size)
+    if (!self->rx_active)
     {
-        uart->rx_buf[uart->rx_wr] = byte;
-        uart->rx_wr++;
+        return;
+    }
+
+    uint8_t byte = self->ops->read_byte();
+
+    if (self->rx_wr < self->rx_size)
+    {
+        self->rx_buf[self->rx_wr] = byte;
+        self->rx_wr++;
     }
     else
     {
-        uart->rx_overflow = true;
+        self->rx_overflow = true;
     }
 
-    uart->timeout_tick_cnt = 0u;
+    self->timeout_tick_cnt = 0u;
 }
 
 /**
@@ -238,44 +280,57 @@ void uart_control_rx_isr(struct uart_control *uart)
  *
  * 由发送完成中断调用，清除发送忙标志后回调 on_tx_done_callback 通知应用层。
  */
-void uart_control_tx_done_isr(struct uart_control *uart)
+void uart_control_tx_done_isr(struct uart_control *self)
 {
-    uart->tx_busy = false;
-
-    if (uart->on_tx_done_callback != NULL)
+    if (self == NULL)
     {
-        uart->on_tx_done_callback(uart);
+        return;
+    }
+
+    self->tx_busy = false;
+
+    if (self->on_tx_done_callback != NULL)
+    {
+        self->on_tx_done_callback(self);
     }
 }
 
 /**
  * @brief  ISR: 空闲超时，一帧接收完成
  *
- * 由空闲定时器中断调用。停止接收，回调 on_rx_done_callback(uart, len)。
+ * 由空闲定时器中断调用。停止接收，回调 on_rx_done_callback(self, len)。
  * 若超时时缓冲区为空则忽略。
  */
-void uart_control_timer_isr(struct uart_control *uart)
+void uart_control_timer_isr(struct uart_control *self)
 {
-    if (!uart->rx_active)
+    if (self == NULL || self->ops == NULL || self->ops->rx_stop == NULL)
     {
         return;
     }
 
-    uint16_t len = uart->rx_wr;
-
-    if (len > 0u)
+    if (!self->rx_active)
     {
-        uart->timeout_tick_cnt++;
+        return;
+    }
 
-        if (uart->timeout_tick_cnt >= uart->timeout_tick)
+    if (self->rx_wr == 0u)
+    {
+        return;
+    }
+
+    self->timeout_tick_cnt++;
+
+    if (self->timeout_tick_cnt >= self->timeout_tick)
+    {
+        uint16_t len;
+
+        self->ops->rx_stop();
+        self->rx_active = false;
+        len = self->rx_wr;
+
+        if (self->on_rx_done_callback != NULL)
         {
-            uart->ops->rx_stop();
-            uart->rx_active = false;
-
-            if (uart->on_rx_done_callback != NULL)
-            {
-                uart->on_rx_done_callback(uart, len);
-            }
+            self->on_rx_done_callback(self, len);
         }
     }
 }

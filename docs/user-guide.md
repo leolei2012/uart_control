@@ -35,9 +35,10 @@ static uint8_t uart1_rx_buf[128];   /* 只需接收缓冲，发送不需要 */
 ### 3.2 适配底层硬件（实现 4 个 ops）
 
 ```c
-static void uart1_send(const uint8_t *buf, uint16_t len)
+static uint8_t uart1_send(const uint8_t *buf, uint16_t len)
 {
-    /* 启动 UART DMA/中断发送，数据源是 buf */
+    /* 启动 UART DMA/中断发送，数据源是 buf；失败返回 UART_CONTROL_ERROR */
+    return UART_CONTROL_OK;
 }
 
 static void uart1_rx_start(void)   { /* 使能 UART 接收 */ }
@@ -60,26 +61,26 @@ static const struct uart_control_hal_ops uart1_ops = {
 ### 3.3 实现回调
 
 ```c
-static void uart1_rx_done(struct uart_control *uart, uint16_t len)
+static void uart1_rx_done(struct uart_control *self, uint16_t len)
 {
     uint8_t byte;
 
-    if (uart_control_rx_overflow(uart))
+    if (uart_control_rx_overflow(self))
     {
         /* 帧超过 rx_buf，数据已被截断，按需丢弃或告警 */
     }
 
-    while (uart_control_rx_read(uart, &byte))
+    while (uart_control_rx_read(self, &byte))
     {
         /* 逐个字节处理这一帧 */
     }
 
-    uart_control_enable_rx(uart);   /* 处理完重新启动接收 */
+    uart_control_enable_rx(self);   /* 处理完重新启动接收 */
 }
 
-static void uart1_tx_done(struct uart_control *uart)
+static void uart1_tx_done(struct uart_control *self)
 {
-    (void)uart;
+    (void)self;
     /* 发送完成，此时可以安全复用上一次发送的 buf */
 }
 ```
@@ -120,7 +121,7 @@ switch (uart_control_send(&uart1, tx_frame, len))
 {
 case UART_CONTROL_OK:    break;   /* 已启动发送 */
 case UART_CONTROL_BUSY:  break;   /* 上一帧还没发完，稍后再试 */
-default:                 break;   /* buf == NULL 或 len == 0 */
+default:                 break;   /* 参数非法或发送启动失败 */
 }
 
 /* 注意：在 uart1_tx_done 回调之前，不要再改写 tx_frame */
@@ -134,13 +135,14 @@ default:                 break;   /* buf == NULL 或 len == 0 */
 |------|------|
 | `uart_control_init()` | 初始化实例：绑定 ops、RX 缓冲、超时时间、回调 |
 | `uart_control_enable_rx()` | 启动一帧接收（清空读写指针、溢出标志） |
-| `uart_control_send(uart, buf, len)` | 零拷贝发送一帧，DMA 直接读 `buf` |
+| `uart_control_send(self, buf, len)` | 零拷贝发送一帧，DMA 直接读 `buf` |
 | `uart_control_rx_len()` | 当前帧总长度（已接收字节数） |
 | `uart_control_rx_remaining()` | 当前帧剩余未读字节数 |
 | `uart_control_rx_read()` | 读当前帧下一字节，读完返回 `false` |
 | `uart_control_rx_overflow()` | 当前帧是否接收溢出（被截断） |
 | `uart_control_bind_rx_done_callback()` | 运行时更换接收完成回调 |
 | `uart_control_bind_tx_done_callback()` | 运行时更换发送完成回调 |
+| `uart_control_set_ctx()` | 设置用户上下文（回调里通过 `self->ctx` 取回） |
 | `uart_control_rx_isr()` | 接收中断入口（每收到 1 字节调用一次） |
 | `uart_control_tx_done_isr()` | 发送完成中断入口 |
 | `uart_control_timer_isr()` | 空闲超时定时器入口（周期调用） |
@@ -154,7 +156,7 @@ default:                 break;   /* buf == NULL 或 len == 0 */
 1. `uart_control_enable_rx()` 启动接收。
 2. 每收到 1 字节，在接收中断里调 `uart_control_rx_isr()`，模块把它写入 `rx_buf` 并清零超时计数。
 3. 定时器周期性调 `uart_control_timer_isr()`。
-4. 连续空闲达到 `timeout_tick` 次后，模块停止接收，回调 `on_rx_done_callback(uart, len)`。
+4. 连续空闲达到 `timeout_tick` 次后，模块停止接收，回调 `on_rx_done_callback(self, len)`。
 5. 你在回调里读数据，处理完后再次调 `uart_control_enable_rx()` 启动下一帧。
 
 **`timeout_tick` 的单位** = 你调用 `uart_control_timer_isr()` 的周期。例如定时器每 1ms 调一次，`timeout_tick = 5` 表示空闲 5ms 判定一帧结束。注意这个值要小于两帧之间的正常间隔，否则会把两帧误拼成一帧。
@@ -166,7 +168,7 @@ default:                 break;   /* buf == NULL 或 len == 0 */
 发送流程：
 
 1. 你在自己的 buffer 里组好帧。
-2. `uart_control_send(uart, buf, len)` 检查后置 `tx_busy = true`，调 `ops->send(buf, len)` 启动 DMA。
+2. `uart_control_send(self, buf, len)` 检查后置 `tx_busy = true`，调 `ops->send(buf, len)` 启动 DMA；若 `ops->send` 返回非 `UART_CONTROL_OK`，模块回滚 `tx_busy` 并返回 `UART_CONTROL_ERROR`。
 3. DMA 完成后，你在发送完成中断里调 `uart_control_tx_done_isr()`，模块清 `tx_busy` 并回调 `on_tx_done_callback`。
 4. 回调后你才能安全复用 `buf`。
 
@@ -183,8 +185,7 @@ default:                 break;   /* buf == NULL 或 len == 0 */
 | 返回值 | 含义 |
 |--------|------|
 | `UART_CONTROL_OK` | 成功 |
-| `UART_CONTROL_ERROR` | 参数非法（NULL 指针、len=0 等） |
-| `UART_CONTROL_TIMEOUT` | 预留状态，当前未使用 |
+| `UART_CONTROL_ERROR` | 参数非法（NULL 指针、len=0 等）或发送启动失败 |
 | `UART_CONTROL_BUSY` | 正在发送，暂不能启动新发送 |
 
 ---
@@ -201,7 +202,7 @@ default:                 break;   /* buf == NULL 或 len == 0 */
 
 5. **ISR 未接入 / 接入顺序错误** —— 三个 ISR 入口（`rx_isr`/`tx_done_isr`/`timer_isr`）都要接，且在 `uart_control_init()` 成功后再调用。
 
-6. **多实例** —— 每个 UART 一个 `struct uart_control` 实例 + 各自的 `rx_buf` + 各自的 ops。回调都带 `uart` 参数，用它区分是哪一路。
+6. **多实例** —— 每个 UART 一个 `struct uart_control` 实例 + 各自的 `rx_buf` + 各自的 ops。回调都带 `self` 参数，用它区分是哪一路。
 
 ---
 
@@ -215,28 +216,28 @@ static uint8_t echo_rx_buf[128];
 static uint8_t echo_tx_buf[128];   /* 应用自己的发送缓冲 */
 
 /* --- 回调 --- */
-static void echo_on_rx(struct uart_control *uart, uint16_t len)
+static void echo_on_rx(struct uart_control *self, uint16_t len)
 {
     uint16_t i = 0;
 
-    if (uart_control_rx_overflow(uart))
+    if (uart_control_rx_overflow(self))
         return;                       /* 溢出丢弃 */
 
-    while (i < len && uart_control_rx_read(uart, &echo_tx_buf[i]))
+    while (i < len && uart_control_rx_read(self, &echo_tx_buf[i]))
         i++;
 
     /* 回显：把收到的原样发回 */
-    if (uart_control_send(uart, echo_tx_buf, i) != UART_CONTROL_OK)
+    if (uart_control_send(self, echo_tx_buf, i) != UART_CONTROL_OK)
     {
         /* 忙则丢弃，或缓冲后重试 */
     }
 
-    uart_control_enable_rx(uart);
+    uart_control_enable_rx(self);
 }
 
-static void echo_on_tx(struct uart_control *uart)
+static void echo_on_tx(struct uart_control *self)
 {
-    (void)uart;
+    (void)self;
     /* echo_tx_buf 现在可以复用了 */
 }
 

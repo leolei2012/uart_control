@@ -5,11 +5,21 @@
 ## 特性
 
 - 硬件无关：发送、启动接收、停止接收、读取字节都由外部 HAL 适配。
-- 支持多实例：回调函数会带回 `struct uart_control *uart`，方便区分不同 UART。
+- 支持多实例：回调函数会带回 `struct uart_control *self`，方便区分不同 UART。
 - 基于空闲超时判断帧结束：逐字节接收，定时器超时后认为一帧完成。
 - 接收缓冲区溢出可检测：帧长超过 `rx_size` 时会设置溢出标志。
 - 发送忙状态可检测：重复发送会返回 `UART_CONTROL_BUSY`。
 - 公共 API 带基本参数检查，降低误用风险。
+
+## 版本号
+
+库版本通过 `uart_control.h` 暴露（编译期可见）：
+
+| 宏 | 说明 |
+|---|---|
+| `UART_CONTROL_VERSION_MAJOR` / `_MINOR` / `_PATCH` | 三段版本号（当前 `1.0.0`） |
+| `UART_CONTROL_VERSION_STRING` | 版本字符串 `"1.0.0"` |
+| `UART_CONTROL_VERSION_NUM` | 打包数值 `0x010000`，用于版本比较 |
 
 ## 设计说明：为什么只提供 RX 缓冲，不提供 TX 缓冲
 
@@ -60,9 +70,10 @@ static uint8_t uart1_rx_buf[128];   /* 只需接收缓冲 */
 根据实际平台实现下面 4 个函数：
 
 ```c
-static void uart1_send(const uint8_t *buf, uint16_t len)
+static uint8_t uart1_send(const uint8_t *buf, uint16_t len)
 {
-    /* 调用芯片 HAL 启动 UART 发送 */
+    /* 调用芯片 HAL 启动 UART 发送，失败时返回 UART_CONTROL_ERROR */
+    return UART_CONTROL_OK;
 }
 
 static void uart1_rx_start(void)
@@ -93,27 +104,27 @@ static const struct uart_control_hal_ops uart1_ops =
 ### 4. 初始化模块
 
 ```c
-static void uart1_rx_done(struct uart_control *uart, uint16_t len)
+static void uart1_rx_done(struct uart_control *self, uint16_t len)
 {
     uint8_t byte;
 
-    if (uart_control_rx_overflow(uart))
+    if (uart_control_rx_overflow(self))
     {
         /* 当前帧超过 RX 缓冲区，数据已被截断 */
     }
 
-    while (uart_control_rx_read(uart, &byte))
+    while (uart_control_rx_read(self, &byte))
     {
         /* 处理接收到的 byte */
     }
 
     /* 如果需要连续接收，处理完成后重新启动下一帧接收 */
-    uart_control_enable_rx(uart);
+    uart_control_enable_rx(self);
 }
 
-static void uart1_tx_done(struct uart_control *uart)
+static void uart1_tx_done(struct uart_control *self)
 {
-    (void)uart;
+    (void)self;
     /* 发送完成处理 */
 }
 
@@ -194,6 +205,7 @@ default:
 | `uart_control_rx_overflow()` | 查询当前帧是否发生接收缓冲区溢出 |
 | `uart_control_bind_rx_done_callback()` | 运行时更换接收完成回调 |
 | `uart_control_bind_tx_done_callback()` | 运行时更换发送完成回调 |
+| `uart_control_set_ctx()` | 设置用户上下文（回调里通过 `self->ctx` 取回，支持多实例） |
 | `uart_control_rx_isr()` | 接收中断入口 |
 | `uart_control_tx_done_isr()` | 发送完成中断入口 |
 | `uart_control_timer_isr()` | 空闲超时定时器入口 |
@@ -203,8 +215,7 @@ default:
 | 返回值 | 含义 |
 | --- | --- |
 | `UART_CONTROL_OK` | 操作成功 |
-| `UART_CONTROL_ERROR` | 参数非法或状态不完整 |
-| `UART_CONTROL_TIMEOUT` | 预留的超时状态 |
+| `UART_CONTROL_ERROR` | 参数非法或发送启动失败 |
 | `UART_CONTROL_BUSY` | UART 正在发送，暂时不能启动新的发送 |
 
 ## 接收流程
@@ -213,7 +224,7 @@ default:
 2. UART 每收到 1 字节，在接收中断里调用 `uart_control_rx_isr()`。
 3. `uart_control_rx_isr()` 保存字节，并把空闲超时计数清零。
 4. 定时器周期性调用 `uart_control_timer_isr()`。
-5. 当连续空闲时间达到 `timeout_tick` 后，模块停止接收并调用 `on_rx_done_callback(uart, len)`。
+5. 当连续空闲时间达到 `timeout_tick` 后，模块停止接收并调用 `on_rx_done_callback(self, len)`。
 6. 应用层在回调中读取数据，处理完成后根据需要再次调用 `uart_control_enable_rx()`。
 
 ## 注意事项
