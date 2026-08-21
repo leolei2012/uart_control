@@ -11,11 +11,16 @@
 - 发送忙状态可检测：重复发送会返回 `UART_CONTROL_BUSY`。
 - 公共 API 带基本参数检查，降低误用风险。
 
+## 设计说明：为什么只提供 RX 缓冲，不提供 TX 缓冲
+
+- **接收（RX）必须由模块持有缓冲**：接收是异步的，数据随时从线上进入，DMA/中断必须写入一个常驻、始终就绪的缓冲，所以该缓冲由调用方在 `uart_control_init()` 时提供（`rx_buf`/`rx_size`）。
+- **发送（TX）由应用传入指针即可**：发送是应用主动发起的，应用已经把帧组好在自己的 buffer 里，发送时把指针传给 `uart_control_send(buf, len)`，DMA 直接读它，无需再拷贝到模块内部缓冲。
+- **代价（调用方约束）**：由于零拷贝，调用方必须保证 `buf` 在发送完成（`on_tx_done_callback` 触发、或 `tx_busy` 清零）之前不被改写/释放。
+
 ## 目录结构
 
 ```text
 .
-├── platform.h
 └── uart_control
     ├── include
     │   └── uart_control.h
@@ -45,11 +50,10 @@ uart_control/include
 ```c
 static struct uart_control uart1;
 
-static uint8_t uart1_rx_buf[128];
-static uint8_t uart1_tx_buf[128];
+static uint8_t uart1_rx_buf[128];   /* 只需接收缓冲 */
 ```
 
-发送前，应用层需要把待发送数据写入 `uart1_tx_buf`，再调用 `uart_control_send()`。
+模块只持有接收缓冲（接收是异步的，必须常驻就绪）。发送不设独立缓冲，应用层发送时直接把自己组好帧的 buffer 指针传给 `uart_control_send()`（零拷贝，见「设计说明」）。
 
 ### 3. 适配底层硬件操作
 
@@ -119,8 +123,6 @@ void uart1_control_init(void)
                           &uart1_ops,
                           uart1_rx_buf,
                           sizeof(uart1_rx_buf),
-                          uart1_tx_buf,
-                          sizeof(uart1_tx_buf),
                           5u,
                           uart1_rx_done,
                           uart1_tx_done) == UART_CONTROL_OK)
@@ -155,10 +157,14 @@ void TIMER_IRQHandler(void)
 
 ## 发送数据
 
-```c
-memcpy(uart1_tx_buf, data, len);
+应用层组好帧后，直接把 buffer 指针和长度传给 `uart_control_send()`（零拷贝，DMA 直接读该 buffer）：
 
-switch (uart_control_send(&uart1, len))
+```c
+uint8_t tx_frame[128];   /* 应用层自己的发送帧缓冲 */
+
+/* ... 填充 tx_frame ... */
+
+switch (uart_control_send(&uart1, tx_frame, len))
 {
 case UART_CONTROL_OK:
     break;
@@ -168,9 +174,11 @@ case UART_CONTROL_BUSY:
     break;
 
 default:
-    /* 参数错误，例如 len 为 0 或超过 tx_size */
+    /* 参数错误，例如 buf 为 NULL 或 len 为 0 */
     break;
 }
+
+/* 注意：DMA 完成前不要改写 tx_frame（见「设计说明」） */
 ```
 
 ## 主要 API
@@ -179,7 +187,7 @@ default:
 | --- | --- |
 | `uart_control_init()` | 初始化 UART 控制实例，绑定 HAL 操作、缓冲区、超时时间和回调 |
 | `uart_control_enable_rx()` | 启动一帧接收，并清空接收状态 |
-| `uart_control_send()` | 启动一帧发送 |
+| `uart_control_send()` | 零拷贝发送一帧（DMA 直接读传入的 buf） |
 | `uart_control_rx_len()` | 获取当前帧总长度 |
 | `uart_control_rx_remaining()` | 获取当前帧剩余未读字节数 |
 | `uart_control_rx_read()` | 读取当前帧中的下一个字节 |
@@ -210,7 +218,7 @@ default:
 
 ## 注意事项
 
-- `uart_control_send()` 只负责发送 `tx_buf` 中已有的数据，不会主动拷贝外部数据。
+- `uart_control_send()` 零拷贝发送：DMA 直接读传入的 `buf`，不拷贝；调用方必须保证 `buf` 在发送完成前保持有效。
 - `uart_control_rx_read()` 读完当前帧后会返回 `false`，读指针会在下一次 `uart_control_enable_rx()` 时复位。
 - 如果 `uart_control_rx_overflow()` 返回 `true`，说明当前帧长度超过 `rx_size`，缓冲区内只保留了前 `rx_size` 字节。
 - `uart_control_timer_isr()` 的调用周期决定了 `timeout_tick` 的实际时间单位。

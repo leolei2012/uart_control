@@ -1,7 +1,9 @@
 #ifndef UART_CONTROL_H
 #define UART_CONTROL_H
 
-#include "platform.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 enum
 {
@@ -26,13 +28,22 @@ enum
  *
  * 使用流程：
  *   1. 填充 struct uart_control_hal_ops，绑定硬件操作
- *   2. uart_control_init() —— 绑定缓冲区、ops、超时时间和回调
+ *   2. uart_control_init() —— 绑定接收缓冲区、ops、超时时间和回调
  *   3. uart_control_enable_rx() —— 启动接收
- *   4. uart_control_send(len) —— 发送数据
+ *   4. uart_control_send(buf, len) —— 零拷贝发送（DMA 直接读 buf）
  *   5. ISR 中调用:
  *      - uart_control_rx_isr()       → 收到一个字节
  *      - uart_control_tx_done_isr()  → 发送完成
  *      - uart_control_timer_isr()    → 空闲超时（帧接收完成）
+ *
+ * 缓冲区归属设计（为什么只有 RX 缓冲，没有 TX 缓冲）：
+ *   - 只持有接收缓冲 rx_buf：接收是异步的，数据随时从线上进入，DMA/中断
+ *     必须写入一个常驻、始终就绪的缓冲，故该缓冲随实例由调用方在 init 提供。
+ *   - 不持有发送缓冲：发送由应用主动发起，应用已把帧组好在自己的 buffer，
+ *     发送时把指针传入 uart_control_send(buf, len) 即可，DMA 直接从 buf 读，
+ *     省去库内冗余拷贝与 tx_buf 内存。
+ *   - 约束：调用方必须保证 buf 在发送完成（on_tx_done_callback / tx_busy
+ *     清零）前保持有效，DMA 期间不得改写。
  */
 
 /**
@@ -64,9 +75,6 @@ struct uart_control
     uint16_t rx_size;                        /**< 接收缓冲区大小 */
     volatile uint16_t rx_wr;                 /**< 当前帧已接收字节数 */
 
-    uint8_t *tx_buf;                         /**< 发送缓冲区 */
-    uint16_t tx_size;                        /**< 发送缓冲区大小 */
-
     uint16_t timeout_tick;                   /**< 空闲超时时间 (ticks) */
     volatile uint16_t timeout_tick_cnt;      /**< 空闲超时计数器 (ticks) */
 
@@ -88,7 +96,7 @@ struct uart_control
 /**
  * @brief  初始化 UART 实例
  *
- * 绑定硬件操作 ops、收发缓冲区、空闲超时时间及完成回调。
+ * 绑定硬件操作 ops、接收缓冲区、空闲超时时间及完成回调。
  * 调用后需手动 uart_control_enable_rx 启动接收。
  *
  * @param timeout_tick  空闲超时时间 (ms)，典型值 5~10
@@ -98,8 +106,6 @@ uint8_t uart_control_init(struct uart_control               *uart,
                           const struct uart_control_hal_ops *ops,
                           uint8_t                           *rx_buf,
                           uint16_t                           rx_size,
-                          uint8_t                           *tx_buf,
-                          uint16_t                           tx_size,
                           uint16_t                           timeout_tick,
                           void (*on_rx_done_callback)(struct uart_control *uart, uint16_t len),
                           void (*on_tx_done_callback)(struct uart_control *uart));
@@ -113,13 +119,15 @@ uint8_t uart_control_init(struct uart_control               *uart,
 uint8_t uart_control_enable_rx(struct uart_control *uart);
 
 /**
- * @brief  发送一帧数据
+ * @brief  发送一帧数据（零拷贝：DMA 直接从调用方缓冲 buf 读取）
  *
  * 调用 ops->send 启动发送，发送完成后回调 on_tx_done_callback。
- * @param len  发送字节数（≤ tx_size）
+ * 调用方需保证 buf 在发送完成（on_tx_done_callback / tx_busy 清零）前保持有效。
+ * @param buf  待发送数据指针
+ * @param len  发送字节数
  * @return UART_CONTROL_OK 成功，UART_CONTROL_ERROR 参数非法，UART_CONTROL_BUSY 发送忙
  */
-uint8_t uart_control_send(struct uart_control *uart, uint16_t len);
+uint8_t uart_control_send(struct uart_control *uart, const uint8_t *buf, uint16_t len);
 
 void uart_control_bind_rx_done_callback(struct uart_control *uart, void (*callback)(struct uart_control *uart, uint16_t len));
 void uart_control_bind_tx_done_callback(struct uart_control *uart, void (*callback)(struct uart_control *uart));

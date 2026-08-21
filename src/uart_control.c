@@ -1,4 +1,5 @@
 #include "uart_control.h"
+#include <string.h>
 
 /**
  * @brief  初始化 UART 实例
@@ -12,13 +13,11 @@ uint8_t uart_control_init(struct uart_control               *uart,
                           const struct uart_control_hal_ops *ops,
                           uint8_t                           *rx_buf,
                           uint16_t                           rx_size,
-                          uint8_t                           *tx_buf,
-                          uint16_t                           tx_size,
                           uint16_t                           timeout_tick,
                           void (*on_rx_done_callback)(struct uart_control *uart, uint16_t len),
                           void (*on_tx_done_callback)(struct uart_control *uart))
 {
-    if (uart == NULL || ops == NULL || rx_buf == NULL || tx_buf == NULL)
+    if (uart == NULL || ops == NULL || rx_buf == NULL)
     {
         return UART_CONTROL_ERROR;
     }
@@ -29,7 +28,7 @@ uint8_t uart_control_init(struct uart_control               *uart,
         return UART_CONTROL_ERROR;
     }
 
-    if (rx_size == 0u || tx_size == 0u || timeout_tick == 0u)
+    if (rx_size == 0u || timeout_tick == 0u)
     {
         return UART_CONTROL_ERROR;
     }
@@ -39,8 +38,6 @@ uint8_t uart_control_init(struct uart_control               *uart,
     uart->ops = ops;
     uart->rx_buf = rx_buf;
     uart->rx_size = rx_size;
-    uart->tx_buf = tx_buf;
-    uart->tx_size = tx_size;
     uart->timeout_tick = timeout_tick;
     uart->on_rx_done_callback = on_rx_done_callback;
     uart->on_tx_done_callback = on_tx_done_callback;
@@ -75,21 +72,23 @@ uint8_t uart_control_enable_rx(struct uart_control *uart)
 }
 
 /**
- * @brief  发送一帧数据
+ * @brief  发送一帧数据（零拷贝：DMA 直接从调用方缓冲 buf 读取）
  *
  * 调用 ops->send 启动发送，发送完成后回调 on_tx_done_callback。
+ * 调用方需保证 buf 在发送完成（on_tx_done_callback / tx_busy 清零）前保持有效。
  *
- * @param len  发送字节数（≤ tx_size）
+ * @param buf  待发送数据指针
+ * @param len  发送字节数
  * @return UART_CONTROL_OK 成功，UART_CONTROL_ERROR 参数非法，UART_CONTROL_BUSY 发送忙
  */
-uint8_t uart_control_send(struct uart_control *uart, uint16_t len)
+uint8_t uart_control_send(struct uart_control *uart, const uint8_t *buf, uint16_t len)
 {
-    if (uart == NULL || uart->tx_buf == NULL || uart->ops == NULL)
+    if (uart == NULL || buf == NULL || uart->ops == NULL)
     {
         return UART_CONTROL_ERROR;
     }
 
-    if (len == 0u || len > uart->tx_size)
+    if (len == 0u)
     {
         return UART_CONTROL_ERROR;
     }
@@ -100,7 +99,7 @@ uint8_t uart_control_send(struct uart_control *uart, uint16_t len)
     }
 
     uart->tx_busy = true;
-    uart->ops->send(uart->tx_buf, len);
+    uart->ops->send(buf, len);
 
     return UART_CONTROL_OK;
 }
