@@ -168,7 +168,7 @@ bool     uart_control_rx_overflow(struct uart_control *self);
 /** @} */
 
 /**
- * @name   ISR 入口（bsp_it.c 中调用）
+ * @name   ISR 入口（在中断服务程序中调用）
  * @{
  */
 
